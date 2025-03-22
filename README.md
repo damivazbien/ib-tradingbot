@@ -42,6 +42,8 @@ env\Scripts\activate      # On Windows
 # source env/bin/activate # On macOS/Linux
 pip install -r requirements.txt
 
+---
+
 ## 🧪 Body Request
 
 {
@@ -50,6 +52,7 @@ pip install -r requirements.txt
     "stock": "AAPL"
 }
 
+---
 
 ## License
 
