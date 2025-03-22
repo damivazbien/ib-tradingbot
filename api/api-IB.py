@@ -1,10 +1,11 @@
 import threading
 import time
 from flask import Flask, request, jsonify
-from ib_insync import IB, Stock, MarketOrder
+from ib_insync import IB, Stock, MarketOrder, Crypto
 import asyncio
 import logging
 import nest_asyncio
+from waitress import serve
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -96,7 +97,7 @@ def wait_for_ib_ready():
     """Wait for IB to be ready or return False"""
     return ib_ready.wait(timeout=15)  # Wait up to 15 seconds
 
-@app.route('/buy', methods=['POST'])
+@app.route('/buyStock', methods=['POST'])
 def buy():
     if not wait_for_ib_ready():
         return jsonify({
@@ -107,8 +108,8 @@ def buy():
     try:
         data = request.get_json()
         percentage = data.get('percentage', 5)
-        #quantity = data.get('quantity', 1)  # default to 1 share if not specified
-
+        stock = data.get('stock', 'TSLA')
+        
         # Read the latest cash balance from our shared variable.
         with account_lock:
             cash_balance = account_summary_data.get('TotalCashValue')
@@ -142,7 +143,7 @@ def buy():
             }), 400
 
         # Define the Tesla stock contract
-        contract = Stock('TSLA', 'SMART', 'USD')
+        contract = Stock(stock, 'SMART', 'USD')
 
         # Create a market order to buy the specified quantity
         order = MarketOrder('BUY', quantity)
@@ -166,7 +167,59 @@ def buy():
             'message': str(e)
         }), 500
 
-@app.route('/sell', methods=['POST'])
+@app.route('/buyBTC', methods=['POST'])
+def buy_btc():
+    if not wait_for_ib_ready():
+        return jsonify({'status': 'error', 'message': 'IB not ready'}), 503
+
+    try:
+        data = request.get_json()
+        percentage = float(data.get('percentage', 0))
+
+        if percentage <= 0 or percentage > 100:
+            return jsonify({'status': 'error', 'message': 'Invalid percentage'}), 400
+
+        with account_lock:
+            portfolio_value = float(account_summary_data.get('NetLiquidation', 0))
+
+        if portfolio_value == 0:
+            return jsonify({'status': 'error', 'message': 'Portfolio value not available'}), 408
+
+        amount_to_invest = portfolio_value * (percentage / 100)
+
+        # Define BTC/USD crypto contract
+        contract = Crypto('BTC', 'PAXOS', 'USD')
+        ib.qualifyContracts(contract)
+
+        # Use delayed market data
+        ib.reqMarketDataType(3)
+        ticker = ib.reqMktData(contract, snapshot=True)
+        ib.waitOnUpdate(timeout=5)
+
+        current_price = ticker.last or ticker.close
+        if current_price is None:
+            return jsonify({'status': 'error', 'message': 'Could not get BTC price'}), 500
+
+        quantity = round(amount_to_invest / current_price, 6)
+
+        order = MarketOrder('BUY', quantity)
+        trade = ib.placeOrder(contract, order)
+        ib.sleep(1)
+
+        return jsonify({
+            'status': 'success',
+            'orderId': trade.order.orderId,
+            'quantity': quantity,
+            'invested_amount': amount_to_invest,
+            'current_price': current_price,
+            'message': f'Placed BUY order for {quantity} BTC'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error buying BTC: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/sellStock', methods=['POST'])
 def sell():
     if not wait_for_ib_ready():
         return jsonify({
@@ -177,9 +230,10 @@ def sell():
     try:
         data = request.get_json()
         quantity = data.get('quantity', 1)  # default to 1 share if not specified
+        stock = data.get('stock', 'TSLA')
 
         # Define the Tesla stock contract
-        contract = Stock('TSLA', 'SMART', 'USD')
+        contract = Stock(stock, 'SMART', 'USD')
 
         # Create a market order to sell the specified quantity
         order = MarketOrder('SELL', quantity)
@@ -368,9 +422,6 @@ def buy_percentage():
             'message': str(e)
         }), 500
 
-
-
-
 @app.route('/positions', methods=['GET'])
 def get_positions():
     """
@@ -410,4 +461,5 @@ def get_positions():
 if __name__ == '__main__':
     # Give IB connection time to establish before starting Flask
     time.sleep(5)
-    app.run(debug=True, use_reloader=False)
+    #app.run(debug=True, use_reloader=False)
+    serve(app, host='0.0.0.0', port=5000)
