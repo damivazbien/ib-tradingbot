@@ -1,5 +1,7 @@
 # 📈 IB Trading Bot API (TSLA & BTC)
 
+![image](https://github.com/user-attachments/assets/14ac550e-36d7-4a0e-a3fb-530d2149b7f2)
+
 This is a Python Flask-based trading API that connects to **Interactive Brokers (IB)** via the `ib_insync` library. It allows you to:
 
 - Place **BUY/SELL orders** for TSLA stock
