@@ -21,6 +21,9 @@ account_summary_data = {}
 account_lock = threading.Lock()
 ib_ready = threading.Event()  # Event to signal when IB is connected and ready
 
+# List of allowed IP addresses
+ALLOWED_IPS = {'127.0.0.1', '1.2.3.4'}  # Add your trusted IPs here
+
 # Create IB instance
 ib = IB()
 
@@ -52,6 +55,16 @@ async def periodic_account_summary():
         if ib.isConnected():
             ib.reqAccountSummary()
         await asyncio.sleep(10000000)  # Request every 10 seconds
+
+def restrict_ip(f):
+    def wrapped(*args, **kwargs):
+        requester_ip = request.remote_addr
+        if requester_ip not in ALLOWED_IPS:
+            logger.warning(f"Unauthorized IP attempted access: {requester_ip}")
+            abort(403)  # Forbidden
+        return f(*args, **kwargs)
+    wrapped.__name__ = f.__name__  # Needed to avoid Flask routing issues
+    return wrapped
 
 async def async_ib_connect():
     logger.info("Connecting to Interactive Brokers...")
@@ -98,6 +111,7 @@ def wait_for_ib_ready():
     return ib_ready.wait(timeout=15)  # Wait up to 15 seconds
 
 @app.route('/buyStock', methods=['POST'])
+@restrict_ip
 def buy():
     if not wait_for_ib_ready():
         return jsonify({
@@ -108,7 +122,14 @@ def buy():
     try:
         data = request.get_json()
         percentage = data.get('percentage', 5)
-        stock = data.get('stock', 'TSLA')
+
+        if 'stock' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'Missing required parameter: stock'
+            }), 400
+        
+        stock = data.get('stock')
         
         # Read the latest cash balance from our shared variable.
         with account_lock:
@@ -220,6 +241,7 @@ def buy_btc():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/sellStock', methods=['POST'])
+@restrict_ip
 def sell():
     if not wait_for_ib_ready():
         return jsonify({
@@ -230,7 +252,14 @@ def sell():
     try:
         data = request.get_json()
         quantity = data.get('quantity', 1)  # default to 1 share if not specified
-        stock = data.get('stock', 'TSLA')
+        
+        if 'stock' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'Missing required parameter: stock'
+            }), 400
+        
+        stock = data.get('stock')
 
         # Define the Tesla stock contract
         contract = Stock(stock, 'SMART', 'USD')
