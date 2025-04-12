@@ -1,11 +1,22 @@
 import threading
 import time
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
+from functools import wraps
 from ib_insync import IB, Stock, MarketOrder, Crypto
 import asyncio
 import logging
 import nest_asyncio
 from waitress import serve
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env
+load_dotenv()
+API_KEY = os.getenv('API_KEY')
+IB_HOST = os.getenv('IB_HOST', '127.0.0.1')  # default if missing
+IB_PORT = int(os.getenv('IB_PORT', 7497))
+ALLOWED_IPS = set(os.getenv('ALLOWED_IPS', '127.0.0.1').split(','))
+
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -21,8 +32,6 @@ account_summary_data = {}
 account_lock = threading.Lock()
 ib_ready = threading.Event()  # Event to signal when IB is connected and ready
 
-# List of allowed IP addresses
-ALLOWED_IPS = {'127.0.0.1', '1.2.3.4'}  # Add your trusted IPs here
 
 # Create IB instance
 ib = IB()
@@ -65,6 +74,15 @@ def restrict_ip(f):
         return f(*args, **kwargs)
     wrapped.__name__ = f.__name__  # Needed to avoid Flask routing issues
     return wrapped
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        api_key = request.headers.get('X-API-KEY')
+        if not api_key or api_key != API_KEY:
+            abort(401)  # Unauthorized
+        return f(*args, **kwargs)
+    return decorated
 
 async def async_ib_connect():
     logger.info("Connecting to Interactive Brokers...")
@@ -110,7 +128,65 @@ def wait_for_ib_ready():
     """Wait for IB to be ready or return False"""
     return ib_ready.wait(timeout=15)  # Wait up to 15 seconds
 
+def get_asset_position(symbol: str):
+    """
+    Get current number of shares and market price for a given stock symbol.
+    """
+    positions = ib.positions()
+    for pos in positions:
+        if pos.contract.symbol.upper() == symbol.upper():
+            return pos.position, pos.marketPrice
+    return 0, 0.0  # No position
+
+def buy(data: dict, percentage: float) -> int:
+    # start buy
+    # Read the latest cash balance from our shared variable.
+    with account_lock:
+        cash_balance = float(account_summary_data.get('TotalCashValue',0))
+    if cash_balance is None:
+        return jsonify({
+            'status': 'error',
+            'message': 'Account summary data not available.'
+        }), 408
+        
+    cash_balance = float(cash_balance)
+
+    # Calculate the amount to invest.
+    amount_to_invest = cash_balance * (percentage / 100.0)
+
+    current_price = data.get('price')#ticker.last if ticker.last is not None else ticker.close
+    if current_price is None:
+        return jsonify({
+            'status': 'error',
+            'message': 'Unable to retrieve current TSLA price.'
+        }), 500
+        
+    # Calculate the number of shares to buy (rounding down).
+    quantity = int(amount_to_invest / current_price)
+        
+    if quantity < 1:
+        raise valueError('Insufficient funds to buy at least 1 share.')
+    # end buy
+    return quantity
+
+def sell(symbol: str, percentage: float) -> int:
+    if not symbol or percentage <= 0:
+        raise ValueError("Missing or invalid stock or percentage.")
+
+    shares_held, current_price = get_asset_position(symbol)
+
+    if shares_held <= 0:
+        raise ValueError(f"No open position in {symbol} to sell.")
+
+    shares_to_sell = int(shares_held * (percentage / 100.0))
+
+    if shares_to_sell < 1:
+        raise ValueError("Calculated shares to sell is less than 1.")
+
+    return shares_to_sell
+
 @app.route('/placeorder', methods=['POST'])
+#@require_api_key
 @restrict_ip
 def placeorder():
     if not wait_for_ib_ready():
@@ -122,7 +198,7 @@ def placeorder():
     try:
         data = request.get_json()
         percentage = data.get('percentage', 5)
-
+        
         if 'stock' not in data:
             return jsonify({
                 'status': 'error',
@@ -130,50 +206,28 @@ def placeorder():
             }), 400
         
         stock = data.get('stock')
+        order_type = data.get('ordertype')
         
-        # Read the latest cash balance from our shared variable.
-        with account_lock:
-            cash_balance = account_summary_data.get('TotalCashValue')
-        if cash_balance is None:
+        if not order_type or order_type.lower() not in ["buy", "sell"]:
             return jsonify({
                 'status': 'error',
-                'message': 'Account summary data not available.'
-            }), 408
+                'message': 'Missing or invalid ordertype. Must be "buy" or "sell".'
+            }), 400
+
+        order_type = order_type.upper()
+
+        if order_type == "BUY":
+            quantity = buy(data, percentage)
+        if order_type == "SELL":
+            quantity = sell(stock, percentage)
         
-        cash_balance = float(cash_balance)
-
-        print(cash_balance)
-
-        # Calculate the amount to invest.
-        amount_to_invest = cash_balance * (percentage / 100.0)
-
-        # Define the Tesla stock contract
-        contract = Stock(stock, 'SMART', 'USD')
-
-        # Request market data snapshot (avoiding live stream issues)
-        logger.info("Requesting TSLA market data snapshot...")
-        ticker = ib.reqMktData(contract, snapshot=True, regulatorySnapshot=False)
-        ib.sleep(2)  # Allow IB time to return the data
-
-        current_price = ticker.last if ticker.last is not None else ticker.close
-        if current_price is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Unable to retrieve current TSLA price.'
-            }), 500
-        
-        # Calculate the number of shares to buy (rounding down).
-        quantity = int(amount_to_invest / current_price)
-        print("quantity",quantity)
-        if quantity < 1:
+        if(quantity < 1):
             return jsonify({
                 'status': 'error',
                 'message': 'Insufficient funds to buy at least 1 share.'
             }), 400
-
-        
-
-        order_type = data.get('ordertype')
+        # Define the Tesla stock contract
+        contract = Stock(stock, 'SMART', 'USD')
         # Create a market order to buy the specified quantity
         order = MarketOrder(order_type, quantity)
         # Place the order
@@ -190,183 +244,6 @@ def placeorder():
 
     except Exception as e:
         logger.error(f"Error in placeorder endpoint: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-@app.route('/buyStock', methods=['POST'])
-@restrict_ip
-def buy():
-    if not wait_for_ib_ready():
-        return jsonify({
-            'status': 'error',
-            'message': 'Interactive Brokers connection not ready'
-        }), 503
-    
-    try:
-        data = request.get_json()
-        percentage = data.get('percentage', 5)
-
-        if 'stock' not in data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Missing required parameter: stock'
-            }), 400
-        
-        stock = data.get('stock')
-        
-        # Read the latest cash balance from our shared variable.
-        with account_lock:
-            cash_balance = account_summary_data.get('TotalCashValue')
-        if cash_balance is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Account summary data not available.'
-            }), 408
-        
-        cash_balance = float(cash_balance)
-
-        print(cash_balance)
-
-        # Calculate the amount to invest.
-        amount_to_invest = cash_balance * (percentage / 100.0)
-
-        current_price = 281#ticker.last if ticker.last is not None else ticker.close
-        if current_price is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Unable to retrieve current TSLA price.'
-            }), 500
-        
-        # Calculate the number of shares to buy (rounding down).
-        quantity = int(amount_to_invest / current_price)
-        print("quantity",quantity)
-        if quantity < 1:
-            return jsonify({
-                'status': 'error',
-                'message': 'Insufficient funds to buy at least 1 share.'
-            }), 400
-
-        # Define the Tesla stock contract
-        contract = Stock(stock, 'SMART', 'USD')
-
-        # Create a market order to buy the specified quantity
-        order = MarketOrder('BUY', quantity)
-
-        # Place the order
-        trade = ib.placeOrder(contract, order)
-
-        # Wait briefly for order confirmation
-        time.sleep(1)
-
-        return jsonify({
-            'status': 'success',
-            'orderId': trade.order.orderId,
-            'message': f'Placed a BUY order for {quantity} TSLA share(s).'
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Error in buy endpoint: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-@app.route('/buyBTC', methods=['POST'])
-def buy_btc():
-    if not wait_for_ib_ready():
-        return jsonify({'status': 'error', 'message': 'IB not ready'}), 503
-
-    try:
-        data = request.get_json()
-        percentage = float(data.get('percentage', 0))
-
-        if percentage <= 0 or percentage > 100:
-            return jsonify({'status': 'error', 'message': 'Invalid percentage'}), 400
-
-        with account_lock:
-            portfolio_value = float(account_summary_data.get('NetLiquidation', 0))
-
-        if portfolio_value == 0:
-            return jsonify({'status': 'error', 'message': 'Portfolio value not available'}), 408
-
-        amount_to_invest = portfolio_value * (percentage / 100)
-
-        # Define BTC/USD crypto contract
-        contract = Crypto('BTC', 'PAXOS', 'USD')
-        ib.qualifyContracts(contract)
-
-        # Use delayed market data
-        ib.reqMarketDataType(3)
-        ticker = ib.reqMktData(contract, snapshot=True)
-        ib.waitOnUpdate(timeout=5)
-
-        current_price = ticker.last or ticker.close
-        if current_price is None:
-            return jsonify({'status': 'error', 'message': 'Could not get BTC price'}), 500
-
-        quantity = round(amount_to_invest / current_price, 6)
-
-        order = MarketOrder('BUY', quantity)
-        trade = ib.placeOrder(contract, order)
-        ib.sleep(1)
-
-        return jsonify({
-            'status': 'success',
-            'orderId': trade.order.orderId,
-            'quantity': quantity,
-            'invested_amount': amount_to_invest,
-            'current_price': current_price,
-            'message': f'Placed BUY order for {quantity} BTC'
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Error buying BTC: {e}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/sellStock', methods=['POST'])
-@restrict_ip
-def sell():
-    if not wait_for_ib_ready():
-        return jsonify({
-            'status': 'error',
-            'message': 'Interactive Brokers connection not ready'
-        }), 503
-        
-    try:
-        data = request.get_json()
-        quantity = data.get('quantity', 1)  # default to 1 share if not specified
-        
-        if 'stock' not in data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Missing required parameter: stock'
-            }), 400
-        
-        stock = data.get('stock')
-
-        # Define the Tesla stock contract
-        contract = Stock(stock, 'SMART', 'USD')
-
-        # Create a market order to sell the specified quantity
-        order = MarketOrder('SELL', quantity)
-
-        # Place the order
-        trade = ib.placeOrder(contract, order)
-
-        # Wait briefly for order confirmation
-        time.sleep(1)
-
-        return jsonify({
-            'status': 'success',
-            'orderId': trade.order.orderId,
-            'message': f'Placed a SELL order for {quantity} TSLA share(s).'
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Error in sell endpoint: {str(e)}")
         return jsonify({
             'status': 'error',
             'message': str(e)
@@ -426,116 +303,6 @@ def get_balance():
         'current_balance': cash_balance,
         'initial_session_balance': initial_balance
     }), 200
-
-@app.route('/buyPercentage', methods=['POST'])
-def buy_percentage():
-    """
-    Buy a percentage of the total portfolio value in TSLA shares.
-    """
-    if not wait_for_ib_ready():
-        return jsonify({
-            'status': 'error',
-            'message': 'Interactive Brokers connection not ready'
-        }), 503
-
-    try:
-        data = request.get_json()
-        percentage = data.get('percentage')
-
-        if percentage is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Percentage parameter is required.'
-            }), 400
-
-        try:
-            percentage = float(percentage)
-        except ValueError:
-            return jsonify({
-                'status': 'error',
-                'message': 'Percentage must be a number.'
-            }), 400
-
-        if percentage <= 0 or percentage > 100:
-            return jsonify({
-                'status': 'error',
-                'message': 'Percentage must be between 0 and 100.'
-            }), 400
-
-        # Use cached account data instead of requesting fresh data
-        with account_lock:
-            portfolio_value = account_summary_data.get('NetLiquidation')  # Total portfolio value
-
-        if portfolio_value is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Portfolio value not available yet. Try again later.'
-            }), 408
-
-        portfolio_value = float(portfolio_value)
-
-        # Calculate the amount to invest (percentage of total portfolio)
-        amount_to_invest = portfolio_value * (percentage / 100.0)
-
-        # Define TSLA contract
-        contract = Stock('TSLA', 'SMART', 'USD')
-        ib.qualifyContracts(contract)
-
-        # Request market data snapshot (avoiding live stream issues)
-        logger.info("Requesting TSLA market data snapshot...")
-        ticker = ib.reqMktData(contract, snapshot=True, regulatorySnapshot=False)
-        ib.sleep(2)  # Allow IB time to return the data
-
-        # Get price from market data
-        current_price = ticker.last if ticker.last else ticker.close
-        logger.info(f"Market data received: last={ticker.last}, close={ticker.close}")
-
-        if current_price is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Unable to retrieve current TSLA price. Check IB market data subscription.'
-            }), 500
-
-        # Calculate the number of shares to buy (rounding down)
-        quantity = int(amount_to_invest / current_price)
-        if quantity < 1:
-            return jsonify({
-                'status': 'error',
-                'message': 'Insufficient funds to buy at least 1 share.'
-            }), 400
-
-        # Ensure IB connection is active before placing order
-        if not ib.isConnected():
-            logger.error("IB connection lost before placing order!")
-            return jsonify({
-                'status': 'error',
-                'message': 'Interactive Brokers connection lost.'
-            }), 503
-
-        # Place a market order for TSLA
-        logger.info(f"Placing market order: BUY {quantity} shares of TSLA...")
-        order = MarketOrder('BUY', quantity)
-        trade = ib.placeOrder(contract, order)
-
-        # Wait for order confirmation
-        ib.sleep(1)
-        logger.info(f"Trade details: {trade}")
-
-        return jsonify({
-            'status': 'success',
-            'orderId': trade.order.orderId,
-            'quantity': quantity,
-            'invested_amount': amount_to_invest,
-            'current_price': current_price,
-            'message': f'Placed a BUY order for {quantity} TSLA share(s), representing {percentage}% of portfolio value.'
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Error in buyPercentage endpoint: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
 
 @app.route('/positions', methods=['GET'])
 def get_positions():
