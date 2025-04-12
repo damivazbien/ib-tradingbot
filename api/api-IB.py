@@ -78,7 +78,7 @@ def restrict_ip(f):
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        api_key = request.headers.get('X-API-KEY')
+        api_key = request.headers.get('X-API-KEY') or request.json.get('api_key')
         if not api_key or api_key != API_KEY:
             abort(401)  # Unauthorized
         return f(*args, **kwargs)
@@ -186,7 +186,7 @@ def sell(symbol: str, percentage: float) -> int:
     return shares_to_sell
 
 @app.route('/placeorder', methods=['POST'])
-#@require_api_key
+@require_api_key
 @restrict_ip
 def placeorder():
     if not wait_for_ib_ready():
