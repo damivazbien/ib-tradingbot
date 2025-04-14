@@ -50,9 +50,11 @@ pip install -r requirements.txt
 ## 🧪 Body Request
 
 {
-    "quantity":10,
-    "percentage": 100,
-    "stock": "AAPL"
+    "percentage": 15,
+    "stock": "AAPL",
+    "ordertype": "buy", // or sell
+    "price": 214.00,
+    "api_key": "APISecret"
 }
 
 ---
