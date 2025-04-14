@@ -135,8 +135,8 @@ def get_asset_position(symbol: str):
     positions = ib.positions()
     for pos in positions:
         if pos.contract.symbol.upper() == symbol.upper():
-            return pos.position, pos.marketPrice
-    return 0, 0.0  # No position
+            return pos.position
+    return 0  # No position
 
 def buy(data: dict, percentage: float) -> int:
     # start buy
@@ -173,7 +173,7 @@ def sell(symbol: str, percentage: float) -> int:
     if not symbol or percentage <= 0:
         raise ValueError("Missing or invalid stock or percentage.")
 
-    shares_held, current_price = get_asset_position(symbol)
+    shares_held = get_asset_position(symbol)
 
     if shares_held <= 0:
         raise ValueError(f"No open position in {symbol} to sell.")
