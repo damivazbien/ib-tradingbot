@@ -39,8 +39,9 @@ ib = IB()
 def build_contract(symbol: str):
     symbol = symbol.upper()
 
-    if symbol == 'BTC':
-        return Crypto('BTC', 'PAXOS', 'USD')
+    if symbol in ['BTC','ETH', 'SOL']:
+        return Crypto(symbol, 'PAXOS', 'USD')
+
     elif symbol == 'XAUUSD_CMDTY':
         # London Gold spot commodity contract
         c = Contract()
