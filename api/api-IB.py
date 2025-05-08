@@ -2,7 +2,7 @@ import threading
 import time
 from flask import Flask, request, jsonify, abort
 from functools import wraps
-from ib_insync import IB, Stock, MarketOrder, Crypto
+from ib_insync import IB, symbol, MarketOrder, Crypto, Forex, Future, Option, Contract
 import asyncio
 import logging
 import nest_asyncio
@@ -35,6 +35,25 @@ ib_ready = threading.Event()  # Event to signal when IB is connected and ready
 
 # Create IB instance
 ib = IB()
+
+def build_contract(symbol: str):
+    symbol = symbol.upper()
+
+    if symbol == 'BTC':
+        return Crypto('BTC', 'PAXOS', 'USD')
+    elif symbol == 'XAUUSD_CMDTY':
+        # London Gold spot commodity contract
+        c = Contract()
+        c.symbol = 'XAU'
+        c.secType = 'CMDTY'
+        c.exchange = 'SMART'
+        c.currency = 'USD'
+        return c
+    elif symbol == 'GC':
+        # Gold Futures (optional)
+        return Future('GC', 'COMEX', 'USD', lastTradeDateOrContractMonth='202406')
+    else:
+        return symbol(symbol, 'SMART', 'USD')
 
 def onAccountSummary(accountValue):
     """
@@ -130,7 +149,7 @@ def wait_for_ib_ready():
 
 def get_asset_position(symbol: str):
     """
-    Get current number of shares and market price for a given stock symbol.
+    Get current number of shares and market price for a given symbol symbol.
     """
     positions = ib.positions()
     for pos in positions:
@@ -171,7 +190,7 @@ def buy(data: dict, percentage: float) -> int:
 
 def sell(symbol: str, percentage: float) -> int:
     if not symbol or percentage <= 0:
-        raise ValueError("Missing or invalid stock or percentage.")
+        raise ValueError("Missing or invalid symbol or percentage.")
 
     shares_held = get_asset_position(symbol)
 
@@ -198,15 +217,16 @@ def placeorder():
     try:
         data = request.get_json()
         percentage = data.get('percentage', 5)
-        
-        if 'stock' not in data:
+        symbol = data.get('symbol')
+        order_type = data.get('ordertype', 'BUY').upper()
+        expyire = data.get('expiry')
+        price = data.get('price', 0)
+
+        if 'symbol' not in data:
             return jsonify({
                 'status': 'error',
-                'message': 'Missing required parameter: stock'
+                'message': 'Missing required parameter: symbol'
             }), 400
-        
-        stock = data.get('stock')
-        order_type = data.get('ordertype')
         
         if not order_type or order_type.lower() not in ["buy", "sell"]:
             return jsonify({
@@ -214,20 +234,23 @@ def placeorder():
                 'message': 'Missing or invalid ordertype. Must be "buy" or "sell".'
             }), 400
 
-        order_type = order_type.upper()
-
-        if order_type == "BUY":
+        # calculate quantity (buy: based on portfolio %, sell: based on position)
+        if order_type == 'BUY':
             quantity = buy(data, percentage)
-        if order_type == "SELL":
-            quantity = sell(stock, percentage)
+        elif order_type == 'SELL':
+            quantity = sell(symbol, percentage)
+        else:
+            return jsonify({'status': 'error', 'message': 'Invalid order type'}), 400
         
         if(quantity < 1):
             return jsonify({
                 'status': 'error',
                 'message': 'Insufficient funds to buy at least 1 share.'
             }), 400
-        # Define the Tesla stock contract
-        contract = Stock(stock, 'SMART', 'USD')
+        
+        symbol = symbol.upper()
+        contract = build_contract(symbol)
+        
         # Create a market order to buy the specified quantity
         order = MarketOrder(order_type, quantity)
         # Place the order
@@ -239,7 +262,7 @@ def placeorder():
         return jsonify({
             'status': 'success',
             'orderId': trade.order.orderId,
-            'message': f'Placed a {order_type} order for {quantity} {stock} share(s).'
+            'message': f'Placed a {order_type} order for {quantity} {symbol} share(s).'
         }), 200
 
     except Exception as e:

@@ -2,3 +2,5 @@
 ./env
 __pycache__/
 *.pyc
+/api/__pycache__/
+/oldfiles
